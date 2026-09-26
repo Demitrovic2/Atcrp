@@ -1,0 +1,304 @@
+name: Build Verified ATC RP iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ios-verified-v0.8.0
+    paths:
+      - 'ios-source/**'
+      - '.github/workflows/ios-build.yml'
+      - 'ATC-RP-Android-build-ready.zip'
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Restore v0.8 source overlay
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf src build-input
+          mkdir -p src build-input/base
+          unzip -q ATC-RP-Android-build-ready.zip -d build-input/base
+          test -f build-input/base/atc-rp/ios/ATCRP.xcodeproj/project.pbxproj
+          mv build-input/base/atc-rp src/atc-rp
+
+          cat ios-source/v0.8-overlay.b64.part-* > build-input/overlay.b64
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          encoded = Path('build-input/overlay.b64').read_text().strip()
+          Path('build-input/overlay.zip').write_bytes(base64.b64decode(encoded, validate=True))
+          PY
+          echo 'ed90103951ad9f1b274e5127e7b8c1b63e533c701e7bbb06c779433b4e99a648  build-input/overlay.zip' | shasum -a 256 -c -
+          unzip -qo build-input/overlay.zip -d src/atc-rp
+          test -f src/atc-rp/ios/Native/ATCDownloadModule.h
+          test -f src/atc-rp/ios/ATCRP/ATCRP-Bridging-Header.h
+
+      - name: Generate ATC RP iOS icon and Home logo
+        shell: bash
+        working-directory: src/atc-rp
+        run: |
+          set -euxo pipefail
+          ICON_DIR='ios/ATCRP/Images.xcassets/AppIcon.appiconset'
+          mkdir -p "$ICON_DIR" assets/images build/icon
+          python3 - <<'PY'
+          import struct, zlib
+          from pathlib import Path
+
+          W = H = 1024
+          bg = (6, 8, 12)
+          red = (229, 31, 45)
+          white = (244, 246, 249)
+          dark = (26, 30, 38)
+          pixels = bytearray(bg * (W * H))
+
+          def rect(x0, y0, x1, y1, c):
+              x0=max(0,x0); y0=max(0,y0); x1=min(W,x1); y1=min(H,y1)
+              for y in range(y0, y1):
+                  off=(y*W+x0)*3
+                  pixels[off:off+(x1-x0)*3] = bytes(c) * (x1-x0)
+
+          rect(96, 700, 928, 780, red)
+          rect(432, 190, 592, 220, red)
+          rect(444, 160, 476, 220, red)
+          rect(496, 130, 528, 220, red)
+          rect(548, 160, 580, 220, red)
+
+          font = {
+            'A':["01110","10001","10001","11111","10001","10001","10001"],
+            'T':["11111","00100","00100","00100","00100","00100","00100"],
+            'C':["01111","10000","10000","10000","10000","10000","01111"],
+            'R':["11110","10001","10001","11110","10100","10010","10001"],
+            'P':["11110","10001","10001","11110","10000","10000","10000"],
+          }
+          def glyph(ch, x, y, scale, color):
+              for ry,row in enumerate(font[ch]):
+                  for rx,v in enumerate(row):
+                      if v=='1': rect(x+rx*scale,y+ry*scale,x+(rx+1)*scale,y+(ry+1)*scale,color)
+
+          scale=58
+          gap=28
+          chars=[('A',white),('T',white),('C',white),('R',red),('P',red)]
+          total=len(chars)*5*scale+(len(chars)-1)*gap
+          x=(W-total)//2
+          y=285
+          for ch,c in chars:
+              glyph(ch,x,y,scale,c)
+              x += 5*scale+gap
+
+          rect(220, 840, 804, 850, dark)
+
+          raw = b''.join(b'\x00' + bytes(pixels[y*W*3:(y+1)*W*3]) for y in range(H))
+          def chunk(tag,data):
+              return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR',struct.pack('>IIBBBBB',W,H,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(raw,9)) + chunk(b'IEND',b'')
+          Path('build/icon/icon-1024.png').write_bytes(png)
+          PY
+
+          cp build/icon/icon-1024.png "$ICON_DIR/icon-1024.png"
+          for n in 20 29 40 58 60 76 80 87 120 152 167 180; do
+            sips -z "$n" "$n" build/icon/icon-1024.png --out "$ICON_DIR/icon-$n.png" >/dev/null
+          done
+          cp build/icon/icon-1024.png assets/images/atc-logo.png
+          test -s "$ICON_DIR/icon-1024.png"
+          test -s assets/images/atc-logo.png
+
+      - name: Install JavaScript dependencies
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm install --no-audit --no-fund
+
+      - name: TypeScript verification
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm run typecheck
+
+      - name: React Native production bundle preflight
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build/preflight
+          mkdir -p build/preflight/assets
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output build/preflight/main.jsbundle \
+            --assets-dest build/preflight/assets
+          test -s build/preflight/main.jsbundle
+          test -s assets/images/atc-logo.png
+
+      - name: Validate iOS metadata
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          plutil -lint ios/ATCRP/Info.plist
+          xmllint --noout ios/ATCRP/LaunchScreen.storyboard
+          grep -q 'MARKETING_VERSION = 0.8.0' ios/ATCRP.xcodeproj/project.pbxproj
+          grep -q 'CURRENT_PROJECT_VERSION = 8' ios/ATCRP.xcodeproj/project.pbxproj
+          grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.atcrp' ios/ATCRP.xcodeproj/project.pbxproj
+          grep -q 'SWIFT_OBJC_BRIDGING_HEADER' ios/ATCRP.xcodeproj/project.pbxproj
+          test -s ios/ATCRP/Images.xcassets/AppIcon.appiconset/icon-1024.png
+
+      - name: Install CocoaPods
+        working-directory: src/atc-rp/ios
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods --no-document
+          fi
+          pod --version
+          pod install --repo-update
+
+      - name: Inspect Xcode workspace
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -d ios/ATCRP.xcworkspace
+          xcodebuild -workspace ios/ATCRP.xcworkspace -scheme ATCRP -list
+
+      - name: Build Release for physical iPhone arm64
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build/DerivedData
+          xcodebuild \
+            -workspace ios/ATCRP.xcworkspace \
+            -scheme ATCRP \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            clean build
+
+          APP_PATH="$PWD/build/DerivedData/Build/Products/Release-iphoneos/ATCRP.app"
+          test -d "$APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Embed verified production JS bundle
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -d "$APP_PATH"
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output "$APP_PATH/main.jsbundle" \
+            --assets-dest "$APP_PATH"
+          test -s "$APP_PATH/main.jsbundle"
+
+      - name: Verify built iPhone app
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -x "$APP_PATH/ATCRP"
+          ARCHS="$(lipo -archs "$APP_PATH/ATCRP")"
+          echo "Built architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw arm64
+
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          test "$VERSION" = '0.8.0'
+          test "$BUILD" = '8'
+          test "$BUNDLE_ID" = 'com.atcrp'
+          test -s "$APP_PATH/Assets.car"
+          test -s "$APP_PATH/main.jsbundle"
+
+      - name: Package unsigned IPA and verification report
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build/export
+          mkdir -p build/export/Payload
+          ditto "$APP_PATH" build/export/Payload/ATCRP.app
+          (
+            cd build/export
+            zip -qry ATC-RP-iOS-v0.8.0-unsigned.ipa Payload
+          )
+          unzip -t build/export/ATC-RP-iOS-v0.8.0-unsigned.ipa
+          (
+            cd build/export
+            shasum -a 256 ATC-RP-iOS-v0.8.0-unsigned.ipa > IPA-SHA256.txt
+          )
+
+          cat > build/export/VERIFICATION.txt <<EOF
+          ATC RP iOS v0.8.0 (build 8) verification
+          ==========================================
+          Git commit: ${GITHUB_SHA}
+          GitHub run: ${GITHUB_RUN_ID}
+
+          PASS - v0.8 source overlay SHA-256
+          PASS - TypeScript typecheck
+          PASS - React Native production bundle preflight
+          PASS - Info.plist and LaunchScreen validation
+          PASS - CocoaPods install
+          PASS - Xcode Release build for generic physical iOS device
+          PASS - arm64 executable present
+          PASS - version 0.8.0 / build 8 / bundle id com.atcrp
+          PASS - compiled asset catalog present
+          PASS - production main.jsbundle embedded
+          PASS - IPA ZIP integrity check
+          PASS - SHA-256 generated for IPA
+
+          Backend API target: https://172-239-18-104.sslip.io/api
+          iOS minimum deployment target: 15.1
+
+          IMPORTANT INSTALLATION NOTE
+          This IPA is intentionally unsigned because no Apple signing certificate or provisioning profile is stored in this repository. A stock iPhone requires valid Apple signing/provisioning before installation.
+
+          GAMEPLAY RUNTIME NOTE
+          This verification covers the ATC RP launcher, native bridges, downloader, auth/chat/mod UI, server query code, Xcode compilation and packaging. It does not claim that a GTA/SA-MP gameplay runtime is embedded. The app only launches embedded gameplay when a separately authorized runtime adapter is linked; otherwise it can use an installed samp:// handler when available.
+          EOF
+
+          cp build/export/ATC-RP-iOS-v0.8.0-unsigned.ipa build/export/ATC-RP-iOS-v0.8.0.ipa
+          rm -rf build/export/Payload
+
+      - name: Prepare reproducible source pack
+        working-directory: src/atc-rp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          zip -qry build/export/ATC-RP-iOS-v0.8.0-source.zip . \
+            -x 'node_modules/*' 'ios/Pods/*' 'build/*' '.git/*'
+
+      - name: Upload verified iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATC-RP-iOS-v0.8.0-verified-unsigned
+          path: |
+            src/atc-rp/build/export/ATC-RP-iOS-v0.8.0.ipa
+            src/atc-rp/build/export/ATC-RP-iOS-v0.8.0-unsigned.ipa
+            src/atc-rp/build/export/ATC-RP-iOS-v0.8.0-source.zip
+            src/atc-rp/build/export/IPA-SHA256.txt
+            src/atc-rp/build/export/VERIFICATION.txt
+          if-no-files-found: error
+          retention-days: 30
