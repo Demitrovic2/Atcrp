@@ -1,0 +1,27 @@
+name: Export ATC RP Base Source
+
+on:
+  push:
+    branches:
+      - ios-verified-v0.8.0
+    paths:
+      - '.github/workflows/export-base.yml'
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract source
+        run: |
+          set -euxo pipefail
+          unzip -q ATC-RP-Android-build-ready.zip
+          test -f atc-rp/ios/ATCRP.xcodeproj/project.pbxproj
+          zip -qry base-source.zip atc-rp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atcrp-base-source
+          path: base-source.zip
+          if-no-files-found: error
+          retention-days: 1
