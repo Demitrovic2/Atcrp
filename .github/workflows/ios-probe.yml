@@ -1,9 +1,6 @@
 name: Probe ATC RP iOS Source
 
 on:
-  push:
-    branches:
-      - ios-verified-v0.8.0
   workflow_dispatch:
 
 jobs:
@@ -11,16 +8,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: List Android build-ready archive
+      - name: Verify iOS source exists
         run: |
           set -euxo pipefail
-          unzip -l ATC-RP-Android-build-ready.zip | tee archive-list.txt
-          if unzip -l ATC-RP-Android-build-ready.zip | grep -q 'ios/ATCRP.xcodeproj/project.pbxproj'; then
-            echo 'IOS_SOURCE_PRESENT=yes' | tee -a archive-list.txt
-          else
-            echo 'IOS_SOURCE_PRESENT=no' | tee -a archive-list.txt
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: archive-list
-          path: archive-list.txt
+          unzip -l ATC-RP-Android-build-ready.zip | grep 'ios/ATCRP.xcodeproj/project.pbxproj'
+          echo 'IOS_SOURCE_PRESENT=yes'
